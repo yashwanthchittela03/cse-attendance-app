@@ -3,7 +3,7 @@ import { supabase } from './supabaseClient';
 import { getScheduleForDate, SubjectSlot } from './timetable_config';
 
 interface DashboardProps {
-  user: { id: string; email: string };
+  user: { id: string; name: string };
   onLogout: () => void;
 }
 
@@ -20,12 +20,17 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
   const [dayAttendance, setDayAttendance] = useState<DayAttendance>({});
   const [overallStats, setOverallStats] = useState({ total: 0, attended: 0 });
   const [loading, setLoading] = useState<boolean>(false);
+  const [saving, setSaving] = useState<boolean>(false);
+  const [hasChanges, setHasChanges] = useState<boolean>(false);
+  const [hasExistingRecord, setHasExistingRecord] = useState<boolean>(false);
 
   const currentSchedule: SubjectSlot[] = getScheduleForDate(selectedDate);
 
-  // Fetch attendance for selected date
+  // Fetch attendance for the selected date from Supabase
   const fetchDateAttendance = useCallback(async () => {
     setLoading(true);
+    setHasChanges(false);
+
     const { data, error } = await supabase
       .from('attendance')
       .select('slot_key, status')
@@ -34,15 +39,20 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
 
     if (!error && data) {
       const mapped: DayAttendance = {};
-      data.forEach((row: any) => {
-        mapped[row.slot_key] = row.status as AttendanceStatus;
-      });
+      if (data.length > 0) {
+        setHasExistingRecord(true);
+        data.forEach((row: any) => {
+          mapped[row.slot_key] = row.status as AttendanceStatus;
+        });
+      } else {
+        setHasExistingRecord(false);
+      }
       setDayAttendance(mapped);
     }
     setLoading(false);
   }, [selectedDate, user.id]);
 
-  // Fetch total overall statistics
+  // Fetch total stats across all dates
   const fetchOverallStats = useCallback(async () => {
     const { data, error } = await supabase
       .from('attendance')
@@ -69,61 +79,62 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     fetchOverallStats();
   }, [selectedDate, fetchDateAttendance, fetchOverallStats]);
 
-  const handleToggle = async (slotIndex: number, status: AttendanceStatus) => {
+  // Handle local state changes (doesn't push to database until Save is clicked)
+  const handleToggle = (slotIndex: number, status: AttendanceStatus) => {
     const slotKey = `slot_${slotIndex}`;
-    
-    // Optimistic UI Update
     setDayAttendance((prev) => ({ ...prev, [slotKey]: status }));
-
-    const { error } = await supabase
-      .from('attendance')
-      .upsert(
-        {
-          user_id: user.id,
-          date: selectedDate,
-          slot_key: slotKey,
-          status: status,
-        },
-        { onConflict: 'user_id,date,slot_key' }
-      );
-
-    if (error) {
-      console.error('Error saving attendance:', error);
-      fetchDateAttendance(); // Rollback if network error
-    } else {
-      fetchOverallStats();
-    }
+    setHasChanges(true);
   };
 
-  const handleBulkMark = async (status: AttendanceStatus) => {
+  const handleBulkMark = (status: AttendanceStatus) => {
+    const newDayState = { ...dayAttendance };
+    currentSchedule.forEach((slot, idx) => {
+      if (slot.isCounted) {
+        newDayState[`slot_${idx}`] = status;
+      }
+    });
+    setDayAttendance(newDayState);
+    setHasChanges(true);
+  };
+
+  // Push local attendance to Supabase on "Save / Update" button click
+  const handleSaveAttendance = async () => {
+    setSaving(true);
+
     const updates = currentSchedule
       .map((slot, idx) => ({ slot, idx }))
-      .filter(({ slot }) => slot.isCounted)
+      .filter(({ slot, idx }) => slot.isCounted && dayAttendance[`slot_${idx}`])
       .map(({ idx }) => ({
         user_id: user.id,
         date: selectedDate,
         slot_key: `slot_${idx}`,
-        status: status,
+        status: dayAttendance[`slot_${idx}`],
       }));
 
-    if (updates.length === 0) return;
-
-    // Optimistic UI Update
-    const newDayState = { ...dayAttendance };
-    updates.forEach((u) => {
-      newDayState[u.slot_key] = status;
-    });
-    setDayAttendance(newDayState);
+    if (updates.length === 0) {
+      alert('Please mark attendance for at least one subject before saving.');
+      setSaving(false);
+      return;
+    }
 
     const { error } = await supabase
       .from('attendance')
       .upsert(updates, { onConflict: 'user_id,date,slot_key' });
 
+    setSaving(false);
+
     if (error) {
-      console.error('Error bulk updating attendance:', error);
-      fetchDateAttendance();
+      console.error('Error saving attendance:', error);
+      alert('Failed to save attendance. Please try again.');
     } else {
+      setHasChanges(false);
+      setHasExistingRecord(true);
       fetchOverallStats();
+      alert(
+        hasExistingRecord
+          ? 'Attendance updated successfully!'
+          : 'Attendance saved successfully!'
+      );
     }
   };
 
@@ -133,158 +144,296 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
       : '100.0';
 
   return (
-    <div style={{ maxWidth: '600px', margin: '0 auto', padding: '20px', fontFamily: 'sans-serif' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-        <h2>CSE Attendance Tracker</h2>
-        <button onClick={onLogout} style={{ padding: '8px 12px', cursor: 'pointer' }}>
-          Logout
-        </button>
-      </div>
-
-      {/* Stats Summary */}
-      <div
-        style={{
-          background: '#f4f4f6',
-          padding: '16px',
-          borderRadius: '8px',
-          marginBottom: '20px',
-          display: 'flex',
-          justifyContent: 'space-around',
-        }}
-      >
-        <div>
-          <small>Total Classes</small>
-          <h3>{overallStats.total}</h3>
-        </div>
-        <div>
-          <small>Attended</small>
-          <h3>{overallStats.attended}</h3>
-        </div>
-        <div>
-          <small>Percentage</small>
-          <h3 style={{ color: Number(percentage) >= 75 ? '#2e7d32' : '#d32f2f' }}>
-            {percentage}%
-          </h3>
-        </div>
-      </div>
-
-      {/* Date Picker */}
-      <div style={{ marginBottom: '20px' }}>
-        <label style={{ fontWeight: 'bold', marginRight: '10px' }}>Select Date:</label>
-        <input
-          type="date"
-          value={selectedDate}
-          onChange={(e) => setSelectedDate(e.target.value)}
-          style={{ padding: '8px', borderRadius: '4px', border: '1px solid #ccc' }}
-        />
-      </div>
-
-      {/* Bulk Action Buttons */}
-      {currentSchedule.length > 0 && (
-        <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
+    <div
+      style={{
+        minHeight: '100vh',
+        backgroundColor: '#121212',
+        color: '#e0e0e0',
+        padding: '20px',
+        fontFamily: 'sans-serif',
+        boxSizing: 'border-box',
+      }}
+    >
+      <div style={{ maxWidth: '600px', margin: '0 auto' }}>
+        {/* Header Bar */}
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginBottom: '20px',
+          }}
+        >
+          <div>
+            <h2 style={{ margin: 0, color: '#ffffff' }}>CSE Attendance Tracker</h2>
+            <small style={{ color: '#a0a0a0' }}>
+              Logged in as: <strong>{user.name}</strong>
+            </small>
+          </div>
           <button
-            onClick={() => handleBulkMark('present')}
+            onClick={onLogout}
             style={{
-              flex: 1,
-              padding: '10px',
-              backgroundColor: '#4caf50',
-              color: 'white',
-              border: 'none',
+              padding: '8px 14px',
+              backgroundColor: '#2a2a2a',
+              color: '#fff',
+              border: '1px solid #444',
               borderRadius: '6px',
-              fontWeight: 'bold',
               cursor: 'pointer',
+              fontWeight: 'bold',
             }}
           >
-            Mark All Present
-          </button>
-          <button
-            onClick={() => handleBulkMark('absent')}
-            style={{
-              flex: 1,
-              padding: '10px',
-              backgroundColor: '#f44336',
-              color: 'white',
-              border: 'none',
-              borderRadius: '6px',
-              fontWeight: 'bold',
-              cursor: 'pointer',
-            }}
-          >
-            Mark All Absent
+            Logout
           </button>
         </div>
-      )}
 
-      {/* Class List */}
-      <h3>Classes for {selectedDate}</h3>
-      {loading ? (
-        <p>Loading attendance...</p>
-      ) : currentSchedule.length === 0 ? (
-        <p style={{ color: '#666' }}>No classes scheduled for this day.</p>
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          {currentSchedule.map((slot, idx) => {
-            const status = dayAttendance[`slot_${idx}`] || 'unmarked';
-            return (
-              <div
-                key={idx}
-                style={{
-                  border: '1px solid #ddd',
-                  borderRadius: '8px',
-                  padding: '12px 16px',
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  backgroundColor: !slot.isCounted ? '#f9f9f9' : '#fff',
-                }}
-              >
-                <div>
-                  <strong>{slot.subject}</strong>
-                  <div style={{ fontSize: '12px', color: '#666' }}>{slot.time}</div>
-                  {!slot.isCounted && (
-                    <span style={{ fontSize: '10px', color: '#999' }}>Non-attendance slot</span>
+        {/* Stats Card */}
+        <div
+          style={{
+            background: '#1e1e1e',
+            border: '1px solid #2d2d2d',
+            padding: '16px',
+            borderRadius: '10px',
+            marginBottom: '20px',
+            display: 'flex',
+            justifyContent: 'space-around',
+          }}
+        >
+          <div style={{ textAlign: 'center' }}>
+            <small style={{ color: '#888' }}>Total Classes</small>
+            <h3 style={{ margin: '4px 0 0 0', color: '#fff' }}>{overallStats.total}</h3>
+          </div>
+          <div style={{ textAlign: 'center' }}>
+            <small style={{ color: '#888' }}>Attended</small>
+            <h3 style={{ margin: '4px 0 0 0', color: '#fff' }}>{overallStats.attended}</h3>
+          </div>
+          <div style={{ textAlign: 'center' }}>
+            <small style={{ color: '#888' }}>Percentage</small>
+            <h3
+              style={{
+                margin: '4px 0 0 0',
+                color: Number(percentage) >= 75 ? '#4caf50' : '#f44336',
+              }}
+            >
+              {percentage}%
+            </h3>
+          </div>
+        </div>
+
+        {/* Date Selector */}
+        <div
+          style={{
+            marginBottom: '20px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center' }}>
+            <label style={{ fontWeight: 'bold', marginRight: '10px', color: '#ccc' }}>
+              Select Date:
+            </label>
+            <input
+              type="date"
+              value={selectedDate}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              style={{
+                padding: '8px 12px',
+                borderRadius: '6px',
+                border: '1px solid #333',
+                fontSize: '14px',
+                backgroundColor: '#2a2a2a',
+                color: '#ffffff',
+                colorScheme: 'dark',
+              }}
+            />
+          </div>
+
+          {hasExistingRecord && (
+            <span
+              style={{
+                fontSize: '12px',
+                padding: '4px 8px',
+                borderRadius: '4px',
+                backgroundColor: '#1b3820',
+                color: '#81c784',
+                border: '1px solid #2e7d32',
+              }}
+            >
+              ✓ Saved in Cloud
+            </span>
+          )}
+        </div>
+
+        {/* Quick Bulk Action Buttons */}
+        {currentSchedule.length > 0 && (
+          <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
+            <button
+              onClick={() => handleBulkMark('present')}
+              style={{
+                flex: 1,
+                padding: '10px',
+                backgroundColor: '#1b5e20',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '6px',
+                fontWeight: 'bold',
+                cursor: 'pointer',
+              }}
+            >
+              Mark All Present
+            </button>
+            <button
+              onClick={() => handleBulkMark('absent')}
+              style={{
+                flex: 1,
+                padding: '10px',
+                backgroundColor: '#b71c1c',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '6px',
+                fontWeight: 'bold',
+                cursor: 'pointer',
+              }}
+            >
+              Mark All Absent
+            </button>
+          </div>
+        )}
+
+        {/* Class List */}
+        <h3 style={{ color: '#ffffff', marginBottom: '12px' }}>
+          Classes for {selectedDate}
+        </h3>
+
+        {loading ? (
+          <p style={{ color: '#888' }}>Loading attendance data...</p>
+        ) : currentSchedule.length === 0 ? (
+          <p style={{ color: '#888' }}>No classes scheduled for this day.</p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            {currentSchedule.map((slot, idx) => {
+              const status = dayAttendance[`slot_${idx}`] || 'unmarked';
+              return (
+                <div
+                  key={idx}
+                  style={{
+                    border: '1px solid #2d2d2d',
+                    borderRadius: '8px',
+                    padding: '12px 16px',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    backgroundColor: !slot.isCounted ? '#181818' : '#1e1e1e',
+                  }}
+                >
+                  <div>
+                    <strong style={{ fontSize: '15px', color: '#ffffff' }}>
+                      {slot.subject}
+                    </strong>
+                    <div
+                      style={{
+                        fontSize: '12px',
+                        color: '#888',
+                        marginTop: '2px',
+                      }}
+                    >
+                      {slot.time}
+                    </div>
+                    {!slot.isCounted && (
+                      <span
+                        style={{
+                          fontSize: '10px',
+                          color: '#666',
+                          fontStyle: 'italic',
+                        }}
+                      >
+                        Non-attendance slot
+                      </span>
+                    )}
+                  </div>
+
+                  {slot.isCounted ? (
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button
+                        onClick={() => handleToggle(idx, 'present')}
+                        style={{
+                          padding: '6px 14px',
+                          borderRadius: '4px',
+                          border: 'none',
+                          cursor: 'pointer',
+                          backgroundColor:
+                            status === 'present' ? '#2e7d32' : '#333333',
+                          color: status === 'present' ? '#fff' : '#aaa',
+                          fontWeight: status === 'present' ? 'bold' : 'normal',
+                        }}
+                      >
+                        Present
+                      </button>
+                      <button
+                        onClick={() => handleToggle(idx, 'absent')}
+                        style={{
+                          padding: '6px 14px',
+                          borderRadius: '4px',
+                          border: 'none',
+                          cursor: 'pointer',
+                          backgroundColor:
+                            status === 'absent' ? '#c62828' : '#333333',
+                          color: status === 'absent' ? '#fff' : '#aaa',
+                          fontWeight: status === 'absent' ? 'bold' : 'normal',
+                        }}
+                      >
+                        Absent
+                      </button>
+                    </div>
+                  ) : (
+                    <span style={{ fontSize: '12px', color: '#666' }}>
+                      Excluded
+                    </span>
                   )}
                 </div>
+              );
+            })}
 
-                {slot.isCounted ? (
-                  <div style={{ display: 'flex', gap: '8px' }}>
-                    <button
-                      onClick={() => handleToggle(idx, 'present')}
-                      style={{
-                        padding: '6px 12px',
-                        borderRadius: '4px',
-                        border: 'none',
-                        cursor: 'pointer',
-                        backgroundColor: status === 'present' ? '#2e7d32' : '#e0e0e0',
-                        color: status === 'present' ? '#fff' : '#000',
-                        fontWeight: status === 'present' ? 'bold' : 'normal',
-                      }}
-                    >
-                      Present
-                    </button>
-                    <button
-                      onClick={() => handleToggle(idx, 'absent')}
-                      style={{
-                        padding: '6px 12px',
-                        borderRadius: '4px',
-                        border: 'none',
-                        cursor: 'pointer',
-                        backgroundColor: status === 'absent' ? '#c62828' : '#e0e0e0',
-                        color: status === 'absent' ? '#fff' : '#000',
-                        fontWeight: status === 'absent' ? 'bold' : 'normal',
-                      }}
-                    >
-                      Absent
-                    </button>
-                  </div>
-                ) : (
-                  <span style={{ fontSize: '12px', color: '#888' }}>Excluded</span>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
+            {/* Dedicated Save / Update Action Button */}
+            <div style={{ marginTop: '20px', textAlign: 'center' }}>
+              <button
+                onClick={handleSaveAttendance}
+                disabled={saving}
+                style={{
+                  width: '100%',
+                  padding: '14px',
+                  backgroundColor: hasExistingRecord ? '#0284c7' : '#2563eb',
+                  color: '#ffffff',
+                  border: 'none',
+                  borderRadius: '8px',
+                  fontWeight: 'bold',
+                  fontSize: '16px',
+                  cursor: 'pointer',
+                  boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+                  opacity: saving ? 0.7 : 1,
+                }}
+              >
+                {saving
+                  ? 'Saving...'
+                  : hasExistingRecord
+                  ? 'Update Attendance'
+                  : 'Save Attendance'}
+              </button>
+              {hasChanges && (
+                <small
+                  style={{
+                    display: 'block',
+                    color: '#eab308',
+                    marginTop: '8px',
+                  }}
+                >
+                  ⚠️ You have unsaved changes. Click above to save.
+                </small>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
