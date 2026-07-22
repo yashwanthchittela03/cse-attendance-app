@@ -26,7 +26,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
 
   const currentSchedule: SubjectSlot[] = getScheduleForDate(selectedDate);
 
-  // Fetch attendance for the selected date from Supabase
+  // Fetch attendance for selected date
   const fetchDateAttendance = useCallback(async () => {
     setLoading(true);
     setHasChanges(false);
@@ -79,12 +79,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     fetchOverallStats();
   }, [selectedDate, fetchDateAttendance, fetchOverallStats]);
 
-  // Handle local state changes (Clicking an active status unselects it back to 'unmarked')
+  // Handle local state changes (click active button to unselect)
   const handleToggle = (slotIndex: number, clickedStatus: AttendanceStatus) => {
     const slotKey = `slot_${slotIndex}`;
     const currentStatus = dayAttendance[slotKey] || 'unmarked';
 
-    // If already active, set back to 'unmarked', otherwise set to clickedStatus
     const newStatus: AttendanceStatus =
       currentStatus === clickedStatus ? 'unmarked' : clickedStatus;
 
@@ -92,7 +91,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     setHasChanges(true);
   };
 
-  // Bulk mark all core subjects while skipping optional OE and Minor courses
+  // Bulk mark core subjects while skipping OE/Minor
   const handleBulkMark = (status: AttendanceStatus) => {
     const newDayState = { ...dayAttendance };
     currentSchedule.forEach((slot, idx) => {
@@ -109,7 +108,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     setHasChanges(true);
   };
 
-  // Push attendance updates to Supabase
+  // Save changes to Supabase
   const handleSaveAttendance = async () => {
     setSaving(true);
 
@@ -155,10 +154,33 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     }
   };
 
-  const percentage =
-    overallStats.total > 0
-      ? ((overallStats.attended / overallStats.total) * 100).toFixed(1)
-      : '100.0';
+  const { total, attended } = overallStats;
+  const currentPercentage =
+    total > 0 ? (attended / total) * 100 : 100;
+
+  // Calculate target recommendation
+  let targetMessage = '';
+  if (total === 0) {
+    targetMessage = 'Mark your first class to see attendance insights!';
+  } else if (currentPercentage < 75) {
+    // Math formula for required consecutive classes:
+    // (attended + x) / (total + x) >= 0.75  =>  x >= 3*total - 4*attended
+    const requiredToAttend = Math.max(0, Math.ceil(3 * total - 4 * attended));
+    targetMessage = `⚠️ Below target! You need to attend the next ${requiredToAttend} class${
+      requiredToAttend === 1 ? '' : 'es'
+    } continuously to reach 75%.`;
+  } else {
+    // Math formula for safe bunks:
+    // attended / (total + y) >= 0.75  =>  y <= (4*attended - 3*total) / 3
+    const safeBunks = Math.floor((4 * attended - 3 * total) / 3);
+    if (safeBunks > 0) {
+      targetMessage = `🎉 You're safe! You can bunk ${safeBunks} class${
+        safeBunks === 1 ? '' : 'es'
+      } and still stay at or above 75%.`;
+    } else {
+      targetMessage = `⚡ On the edge! Attending your next class will give you a margin to bunk.`;
+    }
+  }
 
   return (
     <div
@@ -210,30 +232,47 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
             border: '1px solid #2d2d2d',
             padding: '16px',
             borderRadius: '10px',
-            marginBottom: '20px',
+            marginBottom: '12px',
             display: 'flex',
             justifyContent: 'space-around',
           }}
         >
           <div style={{ textAlign: 'center' }}>
             <small style={{ color: '#888' }}>Total Classes</small>
-            <h3 style={{ margin: '4px 0 0 0', color: '#fff' }}>{overallStats.total}</h3>
+            <h3 style={{ margin: '4px 0 0 0', color: '#fff' }}>{total}</h3>
           </div>
           <div style={{ textAlign: 'center' }}>
             <small style={{ color: '#888' }}>Attended</small>
-            <h3 style={{ margin: '4px 0 0 0', color: '#fff' }}>{overallStats.attended}</h3>
+            <h3 style={{ margin: '4px 0 0 0', color: '#fff' }}>{attended}</h3>
           </div>
           <div style={{ textAlign: 'center' }}>
             <small style={{ color: '#888' }}>Percentage</small>
             <h3
               style={{
                 margin: '4px 0 0 0',
-                color: Number(percentage) >= 75 ? '#4caf50' : '#f44336',
+                color: currentPercentage >= 75 ? '#4caf50' : '#f44336',
               }}
             >
-              {percentage}%
+              {currentPercentage.toFixed(1)}%
             </h3>
           </div>
+        </div>
+
+        {/* 75% Target Status Card */}
+        <div
+          style={{
+            backgroundColor: currentPercentage >= 75 ? '#112918' : '#321414',
+            border: `1px solid ${currentPercentage >= 75 ? '#2e7d32' : '#c62828'}`,
+            color: currentPercentage >= 75 ? '#81c784' : '#ef5350',
+            padding: '12px 16px',
+            borderRadius: '8px',
+            fontSize: '14px',
+            fontWeight: 'bold',
+            textAlign: 'center',
+            marginBottom: '20px',
+          }}
+        >
+          {targetMessage}
         </div>
 
         {/* Date Selector */}
