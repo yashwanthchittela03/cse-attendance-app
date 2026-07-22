@@ -79,10 +79,16 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     fetchOverallStats();
   }, [selectedDate, fetchDateAttendance, fetchOverallStats]);
 
-  // Handle local state changes
-  const handleToggle = (slotIndex: number, status: AttendanceStatus) => {
+  // Handle local state changes (Clicking an active status unselects it back to 'unmarked')
+  const handleToggle = (slotIndex: number, clickedStatus: AttendanceStatus) => {
     const slotKey = `slot_${slotIndex}`;
-    setDayAttendance((prev) => ({ ...prev, [slotKey]: status }));
+    const currentStatus = dayAttendance[slotKey] || 'unmarked';
+
+    // If already active, set back to 'unmarked', otherwise set to clickedStatus
+    const newStatus: AttendanceStatus =
+      currentStatus === clickedStatus ? 'unmarked' : clickedStatus;
+
+    setDayAttendance((prev) => ({ ...prev, [slotKey]: newStatus }));
     setHasChanges(true);
   };
 
