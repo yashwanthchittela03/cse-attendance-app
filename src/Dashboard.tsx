@@ -79,17 +79,23 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     fetchOverallStats();
   }, [selectedDate, fetchDateAttendance, fetchOverallStats]);
 
-  // Handle local state changes (doesn't push to database until Save is clicked)
+  // Handle local state changes
   const handleToggle = (slotIndex: number, status: AttendanceStatus) => {
     const slotKey = `slot_${slotIndex}`;
     setDayAttendance((prev) => ({ ...prev, [slotKey]: status }));
     setHasChanges(true);
   };
 
+  // Bulk mark all core subjects while skipping optional OE and Minor courses
   const handleBulkMark = (status: AttendanceStatus) => {
     const newDayState = { ...dayAttendance };
     currentSchedule.forEach((slot, idx) => {
-      if (slot.isCounted) {
+      const isOptionalCourse =
+        slot.subject.toLowerCase().includes('oe') ||
+        slot.subject.toLowerCase().includes('minor') ||
+        slot.subject.toLowerCase().includes('open elective');
+
+      if (slot.isCounted && !isOptionalCourse) {
         newDayState[`slot_${idx}`] = status;
       }
     });
@@ -97,13 +103,18 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     setHasChanges(true);
   };
 
-  // Push local attendance to Supabase on "Save / Update" button click
+  // Push attendance updates to Supabase
   const handleSaveAttendance = async () => {
     setSaving(true);
 
     const updates = currentSchedule
       .map((slot, idx) => ({ slot, idx }))
-      .filter(({ slot, idx }) => slot.isCounted && dayAttendance[`slot_${idx}`])
+      .filter(
+        ({ slot, idx }) =>
+          slot.isCounted &&
+          dayAttendance[`slot_${idx}`] &&
+          dayAttendance[`slot_${idx}`] !== 'unmarked'
+      )
       .map(({ idx }) => ({
         user_id: user.id,
         date: selectedDate,
@@ -394,7 +405,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
               );
             })}
 
-            {/* Dedicated Save / Update Action Button */}
+            {/* Save / Update Action Button */}
             <div style={{ marginTop: '20px', textAlign: 'center' }}>
               <button
                 onClick={handleSaveAttendance}
