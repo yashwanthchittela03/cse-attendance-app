@@ -1,230 +1,290 @@
-import { useState, useEffect } from 'react';
-import { getScheduleForDate } from './timetable_config';
+import React, { useState, useEffect, useCallback } from 'react';
+import { supabase } from './supabaseClient';
+import { getScheduleForDate, SubjectSlot } from './timetable_config';
 
-interface AttendanceRecord {
-  date: string;
-  classes_attended: number;
-  classes_conducted: number;
+interface DashboardProps {
+  user: { id: string; email: string };
+  onLogout: () => void;
 }
 
-// Attendance state for each subject: 'present' | 'absent' | 'unmarked'
-type SubjectStatus = 'present' | 'absent' | 'unmarked';
+type AttendanceStatus = 'present' | 'absent' | 'unmarked';
 
-export default function Dashboard({ onLogout }: { onLogout: () => void }) {
-  const currentUser = localStorage.getItem('current_user') || 'STUDENT';
+interface DayAttendance {
+  [slotKey: string]: AttendanceStatus;
+}
+
+export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
   const [selectedDate, setSelectedDate] = useState<string>(
     new Date().toISOString().split('T')[0]
   );
-  const [logs, setLogs] = useState<Record<string, AttendanceRecord>>({});
-  const [subjectStates, setSubjectStates] = useState<Record<number, SubjectStatus>>({});
+  const [dayAttendance, setDayAttendance] = useState<DayAttendance>({});
+  const [overallStats, setOverallStats] = useState({ total: 0, attended: 0 });
+  const [loading, setLoading] = useState<boolean>(false);
 
-  const dailySchedule = getScheduleForDate(selectedDate);
-  const eligiblePeriods = dailySchedule.filter((p) => p.hasAttendance);
+  const currentSchedule: SubjectSlot[] = getScheduleForDate(selectedDate);
 
-  useEffect(() => {
-    const savedLogs = localStorage.getItem(`logs_${currentUser}`);
-    if (savedLogs) {
-      setLogs(JSON.parse(savedLogs));
+  // Fetch attendance for selected date
+  const fetchDateAttendance = useCallback(async () => {
+    setLoading(true);
+    const { data, error } = await supabase
+      .from('attendance')
+      .select('slot_key, status')
+      .eq('user_id', user.id)
+      .eq('date', selectedDate);
+
+    if (!error && data) {
+      const mapped: DayAttendance = {};
+      data.forEach((row: any) => {
+        mapped[row.slot_key] = row.status as AttendanceStatus;
+      });
+      setDayAttendance(mapped);
     }
-  }, [currentUser]);
+    setLoading(false);
+  }, [selectedDate, user.id]);
 
-  // When date changes, set all academic subjects to 'unmarked' by default
+  // Fetch total overall statistics
+  const fetchOverallStats = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('attendance')
+      .select('status')
+      .eq('user_id', user.id);
+
+    if (!error && data) {
+      let attended = 0;
+      let total = 0;
+      data.forEach((row: any) => {
+        if (row.status === 'present') {
+          attended += 1;
+          total += 1;
+        } else if (row.status === 'absent') {
+          total += 1;
+        }
+      });
+      setOverallStats({ total, attended });
+    }
+  }, [user.id]);
+
   useEffect(() => {
-    const initialToggles: Record<number, SubjectStatus> = {};
-    dailySchedule.forEach((period) => {
-      if (period.hasAttendance) {
-        initialToggles[period.periodNum] = 'unmarked';
-      }
-    });
-    setSubjectStates(initialToggles);
-  }, [selectedDate]);
+    fetchDateAttendance();
+    fetchOverallStats();
+  }, [selectedDate, fetchDateAttendance, fetchOverallStats]);
 
-  const setStatus = (periodNum: number, status: SubjectStatus) => {
-    setSubjectStates((prev) => ({
-      ...prev,
-      [periodNum]: status,
-    }));
+  const handleToggle = async (slotIndex: number, status: AttendanceStatus) => {
+    const slotKey = `slot_${slotIndex}`;
+    
+    // Optimistic UI Update
+    setDayAttendance((prev) => ({ ...prev, [slotKey]: status }));
+
+    const { error } = await supabase
+      .from('attendance')
+      .upsert(
+        {
+          user_id: user.id,
+          date: selectedDate,
+          slot_key: slotKey,
+          status: status,
+        },
+        { onConflict: 'user_id,date,slot_key' }
+      );
+
+    if (error) {
+      console.error('Error saving attendance:', error);
+      fetchDateAttendance(); // Rollback if network error
+    } else {
+      fetchOverallStats();
+    }
   };
 
-  // Check if all scheduled academic periods have been marked Present or Absent
-  const allPeriodsMarked = eligiblePeriods.every(
-    (p) => subjectStates[p.periodNum] && subjectStates[p.periodNum] !== 'unmarked'
-  );
-
-  const handleSave = () => {
-    if (!allPeriodsMarked) return;
-
-    const attendedCount = eligiblePeriods.filter(
-      (p) => subjectStates[p.periodNum] === 'present'
-    ).length;
-    const conductedCount = eligiblePeriods.length;
-
-    const updatedLogs = {
-      ...logs,
-      [selectedDate]: {
+  const handleBulkMark = async (status: AttendanceStatus) => {
+    const updates = currentSchedule
+      .map((slot, idx) => ({ slot, idx }))
+      .filter(({ slot }) => slot.isCounted)
+      .map(({ idx }) => ({
+        user_id: user.id,
         date: selectedDate,
-        classes_attended: attendedCount,
-        classes_conducted: conductedCount,
-      },
-    };
+        slot_key: `slot_${idx}`,
+        status: status,
+      }));
 
-    setLogs(updatedLogs);
-    localStorage.setItem(`logs_${currentUser}`, JSON.stringify(updatedLogs));
-    alert('Attendance saved successfully!');
+    if (updates.length === 0) return;
+
+    // Optimistic UI Update
+    const newDayState = { ...dayAttendance };
+    updates.forEach((u) => {
+      newDayState[u.slot_key] = status;
+    });
+    setDayAttendance(newDayState);
+
+    const { error } = await supabase
+      .from('attendance')
+      .upsert(updates, { onConflict: 'user_id,date,slot_key' });
+
+    if (error) {
+      console.error('Error bulk updating attendance:', error);
+      fetchDateAttendance();
+    } else {
+      fetchOverallStats();
+    }
   };
 
-  const markedList = Object.values(logs);
-  const totalAttended = markedList.reduce((acc, c) => acc + c.classes_attended, 0);
-  const totalConducted = markedList.reduce((acc, c) => acc + c.classes_conducted, 0);
-
-  const percentage = totalConducted > 0 ? (totalAttended / totalConducted) * 100 : 0;
-  const isTargetMet = percentage >= 75;
-
-  const bunksAllowed = isTargetMet
-    ? Math.floor((totalAttended - 0.75 * totalConducted) / 0.75)
-    : 0;
-  const classesNeeded = !isTargetMet && totalConducted > 0
-    ? Math.ceil((0.75 * totalConducted - totalAttended) / 0.25)
-    : 0;
-
-  const dayName = new Date(selectedDate).toLocaleDateString('en-US', { weekday: 'long' });
+  const percentage =
+    overallStats.total > 0
+      ? ((overallStats.attended / overallStats.total) * 100).toFixed(1)
+      : '100.0';
 
   return (
-    <div className="min-h-screen bg-slate-950 text-white p-4 font-sans">
-      <div className="max-w-md mx-auto space-y-6 pt-4">
-        
-        {/* Header */}
-        <div className="flex justify-between items-center">
-          <span className="text-xs font-semibold text-slate-400 uppercase tracking-widest">
-            {currentUser} • Attendance Tracker
-          </span>
-          <button
-            onClick={() => {
-              localStorage.removeItem('current_user');
-              onLogout();
-            }}
-            className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-900 transition-colors text-xs font-bold"
-          >
-            Log Out
-          </button>
-        </div>
-
-        {/* Overall Stats */}
-        <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 text-center shadow-xl space-y-4">
-          <span className="text-xs font-medium text-slate-400 uppercase tracking-wider">
-            Overall Attendance
-          </span>
-          <div className="text-6xl font-black tracking-tight text-white">
-            {percentage.toFixed(1)}%
-          </div>
-
-          <div className="text-xs text-slate-400">
-            {totalAttended} / {totalConducted} academic periods attended
-          </div>
-
-          {totalConducted === 0 ? (
-            <p className="text-xs text-slate-500 italic">No days marked yet. Pick a date below!</p>
-          ) : isTargetMet ? (
-            <div className="inline-flex items-center gap-2 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-4 py-2 rounded-full text-xs font-semibold">
-              <span>Target Reached! ({bunksAllowed} bunks left)</span>
-            </div>
-          ) : (
-            <div className="inline-flex items-center gap-2 bg-amber-500/10 text-amber-400 border border-amber-500/20 px-4 py-2 rounded-full text-xs font-semibold">
-              <span>Need {classesNeeded} consecutive classes</span>
-            </div>
-          )}
-        </div>
-
-        {/* Date Selector & Per-Subject List */}
-        <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-xl space-y-5">
-          <div className="flex items-center justify-between">
-            <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-              Choose Date
-            </label>
-            <input
-              type="date"
-              value={selectedDate}
-              onChange={(e) => setSelectedDate(e.target.value)}
-              className="bg-slate-800 border border-slate-700 text-white text-xs rounded-xl px-3 py-2 focus:outline-none focus:border-indigo-500"
-            />
-          </div>
-
-          <div className="space-y-3">
-            <div className="flex justify-between items-center text-xs text-slate-400 pb-1">
-              <span>{dayName} Classes</span>
-              <span>{eligiblePeriods.length} Academic Subjects</span>
-            </div>
-
-            {dailySchedule.length === 0 ? (
-              <p className="text-xs text-slate-500 italic py-4 text-center">
-                No classes scheduled for this date.
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {dailySchedule.map((period) => {
-                  const currentStatus = subjectStates[period.periodNum] || 'unmarked';
-
-                  return (
-                    <div
-                      key={period.periodNum}
-                      className="bg-slate-950 border border-slate-800/80 rounded-2xl p-3.5 flex items-center justify-between"
-                    >
-                      <div>
-                        <div className="text-sm font-semibold text-white">{period.subjectName}</div>
-                        <div className="text-[11px] text-slate-500">{period.timeSlot}</div>
-                      </div>
-
-                      {period.hasAttendance ? (
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => setStatus(period.periodNum, 'present')}
-                            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all border ${
-                              currentStatus === 'present'
-                                ? 'bg-emerald-500/20 border-emerald-500 text-emerald-400 shadow-lg shadow-emerald-500/10'
-                                : 'bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700'
-                            }`}
-                          >
-                            ✓ Present
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setStatus(period.periodNum, 'absent')}
-                            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all border ${
-                              currentStatus === 'absent'
-                                ? 'bg-red-500/20 border-red-500 text-red-400 shadow-lg shadow-red-500/10'
-                                : 'bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700'
-                            }`}
-                          >
-                            ✕ Absent
-                          </button>
-                        </div>
-                      ) : (
-                        <span className="px-3 py-1.5 rounded-xl text-xs font-medium bg-slate-800 text-slate-500 border border-slate-700/50">
-                          N/A
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          <button
-            onClick={handleSave}
-            disabled={eligiblePeriods.length === 0 || !allPeriodsMarked}
-            className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-3.5 rounded-2xl shadow-lg shadow-indigo-600/20 transition-all disabled:opacity-40 disabled:cursor-not-allowed text-sm"
-          >
-            {!allPeriodsMarked && eligiblePeriods.length > 0
-              ? 'Mark all subjects to save'
-              : logs[selectedDate]
-              ? 'Update Day Attendance'
-              : 'Save Day Attendance'}
-          </button>
-        </div>
-
+    <div style={{ maxWidth: '600px', margin: '0 auto', padding: '20px', fontFamily: 'sans-serif' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+        <h2>CSE Attendance Tracker</h2>
+        <button onClick={onLogout} style={{ padding: '8px 12px', cursor: 'pointer' }}>
+          Logout
+        </button>
       </div>
+
+      {/* Stats Summary */}
+      <div
+        style={{
+          background: '#f4f4f6',
+          padding: '16px',
+          borderRadius: '8px',
+          marginBottom: '20px',
+          display: 'flex',
+          justifyContent: 'space-around',
+        }}
+      >
+        <div>
+          <small>Total Classes</small>
+          <h3>{overallStats.total}</h3>
+        </div>
+        <div>
+          <small>Attended</small>
+          <h3>{overallStats.attended}</h3>
+        </div>
+        <div>
+          <small>Percentage</small>
+          <h3 style={{ color: Number(percentage) >= 75 ? '#2e7d32' : '#d32f2f' }}>
+            {percentage}%
+          </h3>
+        </div>
+      </div>
+
+      {/* Date Picker */}
+      <div style={{ marginBottom: '20px' }}>
+        <label style={{ fontWeight: 'bold', marginRight: '10px' }}>Select Date:</label>
+        <input
+          type="date"
+          value={selectedDate}
+          onChange={(e) => setSelectedDate(e.target.value)}
+          style={{ padding: '8px', borderRadius: '4px', border: '1px solid #ccc' }}
+        />
+      </div>
+
+      {/* Bulk Action Buttons */}
+      {currentSchedule.length > 0 && (
+        <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
+          <button
+            onClick={() => handleBulkMark('present')}
+            style={{
+              flex: 1,
+              padding: '10px',
+              backgroundColor: '#4caf50',
+              color: 'white',
+              border: 'none',
+              borderRadius: '6px',
+              fontWeight: 'bold',
+              cursor: 'pointer',
+            }}
+          >
+            Mark All Present
+          </button>
+          <button
+            onClick={() => handleBulkMark('absent')}
+            style={{
+              flex: 1,
+              padding: '10px',
+              backgroundColor: '#f44336',
+              color: 'white',
+              border: 'none',
+              borderRadius: '6px',
+              fontWeight: 'bold',
+              cursor: 'pointer',
+            }}
+          >
+            Mark All Absent
+          </button>
+        </div>
+      )}
+
+      {/* Class List */}
+      <h3>Classes for {selectedDate}</h3>
+      {loading ? (
+        <p>Loading attendance...</p>
+      ) : currentSchedule.length === 0 ? (
+        <p style={{ color: '#666' }}>No classes scheduled for this day.</p>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          {currentSchedule.map((slot, idx) => {
+            const status = dayAttendance[`slot_${idx}`] || 'unmarked';
+            return (
+              <div
+                key={idx}
+                style={{
+                  border: '1px solid #ddd',
+                  borderRadius: '8px',
+                  padding: '12px 16px',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  backgroundColor: !slot.isCounted ? '#f9f9f9' : '#fff',
+                }}
+              >
+                <div>
+                  <strong>{slot.subject}</strong>
+                  <div style={{ fontSize: '12px', color: '#666' }}>{slot.time}</div>
+                  {!slot.isCounted && (
+                    <span style={{ fontSize: '10px', color: '#999' }}>Non-attendance slot</span>
+                  )}
+                </div>
+
+                {slot.isCounted ? (
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button
+                      onClick={() => handleToggle(idx, 'present')}
+                      style={{
+                        padding: '6px 12px',
+                        borderRadius: '4px',
+                        border: 'none',
+                        cursor: 'pointer',
+                        backgroundColor: status === 'present' ? '#2e7d32' : '#e0e0e0',
+                        color: status === 'present' ? '#fff' : '#000',
+                        fontWeight: status === 'present' ? 'bold' : 'normal',
+                      }}
+                    >
+                      Present
+                    </button>
+                    <button
+                      onClick={() => handleToggle(idx, 'absent')}
+                      style={{
+                        padding: '6px 12px',
+                        borderRadius: '4px',
+                        border: 'none',
+                        cursor: 'pointer',
+                        backgroundColor: status === 'absent' ? '#c62828' : '#e0e0e0',
+                        color: status === 'absent' ? '#fff' : '#000',
+                        fontWeight: status === 'absent' ? 'bold' : 'normal',
+                      }}
+                    >
+                      Absent
+                    </button>
+                  </div>
+                ) : (
+                  <span style={{ fontSize: '12px', color: '#888' }}>Excluded</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
-}
+};
