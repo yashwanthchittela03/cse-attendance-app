@@ -39,7 +39,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
 
     if (!error && data) {
       const mapped: DayAttendance = {};
-      if (data.length > 0) {
+      // Only treat as an existing record if there is at least one present/absent mark
+      const activeRecords = data.filter((row: any) => row.status !== 'unmarked');
+      
+      if (activeRecords.length > 0) {
         setHasExistingRecord(true);
         data.forEach((row: any) => {
           mapped[row.slot_key] = row.status as AttendanceStatus;
@@ -52,7 +55,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     setLoading(false);
   }, [selectedDate, user.id]);
 
-  // Fetch total stats across all dates
+  // Fetch total stats across all dates (ignoring 'unmarked' slots)
   const fetchOverallStats = useCallback(async () => {
     const { data, error } = await supabase
       .from('attendance')
@@ -69,6 +72,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
         } else if (row.status === 'absent') {
           total += 1;
         }
+        // 'unmarked' status is explicitly ignored!
       });
       setOverallStats({ total, attended });
     }
@@ -108,48 +112,73 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     setHasChanges(true);
   };
 
-  // Save changes to Supabase
+  // Save/Update changes to Supabase (Handles deleting unselected slots)
   const handleSaveAttendance = async () => {
     setSaving(true);
 
-    const updates = currentSchedule
-      .map((slot, idx) => ({ slot, idx }))
-      .filter(
-        ({ slot, idx }) =>
-          slot.isCounted &&
-          dayAttendance[`slot_${idx}`] &&
-          dayAttendance[`slot_${idx}`] !== 'unmarked'
-      )
-      .map(({ idx }) => ({
-        user_id: user.id,
-        date: selectedDate,
-        slot_key: `slot_${idx}`,
-        status: dayAttendance[`slot_${idx}`],
-      }));
+    const activeUpdates: any[] = [];
+    const slotsToDelete: string[] = [];
 
-    if (updates.length === 0) {
-      alert('Please mark attendance for at least one subject before saving.');
-      setSaving(false);
-      return;
+    currentSchedule.forEach((slot, idx) => {
+      if (slot.isCounted) {
+        const slotKey = `slot_${idx}`;
+        const status = dayAttendance[slotKey];
+
+        if (status === 'present' || status === 'absent') {
+          activeUpdates.push({
+            user_id: user.id,
+            date: selectedDate,
+            slot_key: slotKey,
+            status: status,
+          });
+        } else {
+          // If status is unmarked or cleared, mark slot for deletion from DB
+          slotsToDelete.push(slotKey);
+        }
+      }
+    });
+
+    let hasError = false;
+
+    // 1. Delete cleared/unmarked slots from database
+    if (slotsToDelete.length > 0) {
+      const { error: deleteError } = await supabase
+        .from('attendance')
+        .delete()
+        .eq('user_id', user.id)
+        .eq('date', selectedDate)
+        .in('slot_key', slotsToDelete);
+
+      if (deleteError) {
+        console.error('Error deleting unmarked slots:', deleteError);
+        hasError = true;
+      }
     }
 
-    const { error } = await supabase
-      .from('attendance')
-      .upsert(updates, { onConflict: 'user_id,date,slot_key' });
+    // 2. Upsert active present/absent slots
+    if (activeUpdates.length > 0) {
+      const { error: upsertError } = await supabase
+        .from('attendance')
+        .upsert(activeUpdates, { onConflict: 'user_id,date,slot_key' });
+
+      if (upsertError) {
+        console.error('Error saving attendance:', upsertError);
+        hasError = true;
+      }
+    }
 
     setSaving(false);
 
-    if (error) {
-      console.error('Error saving attendance:', error);
-      alert('Failed to save attendance. Please try again.');
+    if (hasError) {
+      alert('Failed to update attendance. Please try again.');
     } else {
       setHasChanges(false);
-      setHasExistingRecord(true);
+      setHasExistingRecord(activeUpdates.length > 0);
       fetchOverallStats();
       alert(
-        hasExistingRecord
-          ? 'Attendance updated successfully!'
-          : 'Attendance saved successfully!'
+        activeUpdates.length > 0
+          ? 'Attendance saved successfully!'
+          : 'Attendance cleared for this date!'
       );
     }
   };
@@ -163,15 +192,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
   if (total === 0) {
     targetMessage = 'Mark your first class to see attendance insights!';
   } else if (currentPercentage < 75) {
-    // Math formula for required consecutive classes:
-    // (attended + x) / (total + x) >= 0.75  =>  x >= 3*total - 4*attended
     const requiredToAttend = Math.max(0, Math.ceil(3 * total - 4 * attended));
     targetMessage = `⚠️ Below target! You need to attend the next ${requiredToAttend} class${
       requiredToAttend === 1 ? '' : 'es'
     } continuously to reach 75%.`;
   } else {
-    // Math formula for safe bunks:
-    // attended / (total + y) >= 0.75  =>  y <= (4*attended - 3*total) / 3
     const safeBunks = Math.floor((4 * attended - 3 * total) / 3);
     if (safeBunks > 0) {
       targetMessage = `🎉 You're safe! You can bunk ${safeBunks} class${
